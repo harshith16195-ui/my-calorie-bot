@@ -1,0 +1,9 @@
+data/
+*.db
+.env
+*.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+cloudflared
