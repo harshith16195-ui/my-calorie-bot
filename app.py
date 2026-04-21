@@ -592,17 +592,15 @@ def handle_help():
 # ── Webhook ───────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Twilio status-callback POSTs (MessageStatus present) must be ack'd but not processed
-    if request.form.get("MessageStatus"):
-        return str(MessagingResponse()), 200, {"Content-Type": "text/xml"}
-
     incoming_msg = request.form.get("Body", "").strip()
     media_url    = request.form.get("MediaUrl0", "")
     from_number  = request.form.get("From", "")
 
-    # Ignore empty pings (no text, no image)
+    # Delivery status callbacks have no Body and no media — ack and skip
     if not incoming_msg and not media_url:
         return str(MessagingResponse()), 200, {"Content-Type": "text/xml"}
+
+    app.logger.info("MSG from=%s body=%r media=%r", from_number, incoming_msg[:80], bool(media_url))
 
     reply = process_message(incoming_msg, media_url, from_number)
 
