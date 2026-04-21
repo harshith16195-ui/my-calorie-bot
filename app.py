@@ -5,6 +5,7 @@ import json
 import difflib
 import sqlite3
 import base64
+import threading
 import requests
 from datetime import datetime, date
 from flask import Flask, request
@@ -40,6 +41,7 @@ ai     = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Pending confirmations: {from_number: nutrition_data_dict}
 pending_confirmations: dict = {}
+pending_lock = threading.Lock()
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
@@ -447,7 +449,10 @@ def handle_correction(text):
     )
 
 def handle_pending_confirmation(lower, from_number):
-    data = pending_confirmations.pop(from_number)
+    with pending_lock:
+        data = pending_confirmations.pop(from_number, None)
+    if data is None:
+        return None  # raced away; fall through to normal processing
     if lower in ("yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure"):
         log_food(data["food_name"], data["calories"], data["protein"], data["carbs"], data["fat"])
         rows = get_today_totals()
@@ -587,9 +592,17 @@ def handle_help():
 # ── Webhook ───────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # Twilio status-callback POSTs (MessageStatus present) must be ack'd but not processed
+    if request.form.get("MessageStatus"):
+        return str(MessagingResponse()), 200, {"Content-Type": "text/xml"}
+
     incoming_msg = request.form.get("Body", "").strip()
     media_url    = request.form.get("MediaUrl0", "")
     from_number  = request.form.get("From", "")
+
+    # Ignore empty pings (no text, no image)
+    if not incoming_msg and not media_url:
+        return str(MessagingResponse()), 200, {"Content-Type": "text/xml"}
 
     reply = process_message(incoming_msg, media_url, from_number)
 
@@ -603,14 +616,18 @@ def process_message(text, media_url="", from_number=""):
     try:
         # ── Pending confirmation ──
         if from_number and from_number in pending_confirmations:
-            return handle_pending_confirmation(lower, from_number)
+            result = handle_pending_confirmation(lower, from_number)
+            if result is not None:
+                return result
+            # entry was raced away; fall through and process as normal message
 
         # ── Image ──
         if media_url:
             data = analyse_image_food(media_url)
             if data.get("ask_confirmation"):
                 if from_number:
-                    pending_confirmations[from_number] = data
+                    with pending_lock:
+                        pending_confirmations[from_number] = data
                 return (
                     f"🤔 *Just to confirm:*\n{data['confirmation_prompt']}\n\n"
                     f"Reply *yes* to log or *no* to cancel."
@@ -668,7 +685,8 @@ def process_message(text, media_url="", from_number=""):
         data = analyse_text_food(text)
         if data.get("ask_confirmation"):
             if from_number:
-                pending_confirmations[from_number] = data
+                with pending_lock:
+                    pending_confirmations[from_number] = data
             return (
                 f"🤔 *Just to confirm:*\n{data['confirmation_prompt']}\n\n"
                 f"Reply *yes* to log or *no* to cancel."
