@@ -2,6 +2,7 @@
 import os
 import re
 import json
+import difflib
 import sqlite3
 import base64
 import requests
@@ -155,14 +156,36 @@ def delete_entry_by_id(entry_id):
     con.commit()
     con.close()
 
-def find_entry_by_name(food_name, log_date):
+def find_entry_fuzzy(food_name, log_date):
     con = sqlite3.connect(DB_PATH)
-    row = con.execute(
-        "SELECT id FROM food_log WHERE log_date=? AND LOWER(food_name) LIKE ? ORDER BY logged_at DESC LIMIT 1",
-        (log_date, f"%{food_name.lower()}%")
-    ).fetchone()
+    rows = con.execute(
+        "SELECT id, food_name FROM food_log WHERE log_date=? ORDER BY logged_at DESC",
+        (log_date,)
+    ).fetchall()
     con.close()
-    return row
+    if not rows:
+        return None
+    query = food_name.lower()
+    ids   = [r[0] for r in rows]
+    names = [r[1].lower() for r in rows]
+    # exact substring match
+    for i, name in enumerate(names):
+        if query in name or name in query:
+            return (ids[i],)
+    # word-level overlap
+    query_words = set(query.split())
+    best, best_id = 0, None
+    for i, name in enumerate(names):
+        overlap = len(query_words & set(name.split()))
+        if overlap > best:
+            best, best_id = overlap, ids[i]
+    if best_id:
+        return (best_id,)
+    # difflib fuzzy fallback
+    close = difflib.get_close_matches(query, names, n=1, cutoff=0.4)
+    if close:
+        return (ids[names.index(close[0])],)
+    return None
 
 def update_entry(entry_id, food_name, calories, protein, carbs, fat):
     con = sqlite3.connect(DB_PATH)
@@ -198,6 +221,13 @@ def running_totals_msg(cal, pro, car, fat):
     )
 
 # ── Claude calls ──────────────────────────────────────────────────────────────
+def parse_nutrition_json(raw):
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw).strip()
+    return json.loads(raw)
+
 NUTRITION_SYSTEM = f"""You are a friendly personal nutrition coach for {USER['name']}, a {USER['age']}-year-old, {USER['weight']}kg, {USER['height']}cm male.
 Goal: {USER['goal']}. Daily targets: {USER['calories']} kcal | {USER['protein']}g protein | {USER['carbs']}g carbs | {USER['fat']}g fat.
 He trains with weights 4-6 days/week. He is from Andhra Pradesh, India.
@@ -258,7 +288,7 @@ def analyse_text_food(text):
         system=NUTRITION_SYSTEM,
         messages=[{"role": "user", "content": f"Analyse this food and return JSON: {text}"}]
     )
-    return json.loads(resp.content[0].text)
+    return parse_nutrition_json(resp.content[0].text)
 
 def analyse_image_food(image_url):
     img_resp   = requests.get(image_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=15)
@@ -277,7 +307,7 @@ def analyse_image_food(image_url):
             ]
         }]
     )
-    return json.loads(resp.content[0].text)
+    return parse_nutrition_json(resp.content[0].text)
 
 def claude_chat(prompt):
     resp = ai.messages.create(
@@ -393,10 +423,15 @@ def handle_correction(text):
     old_name   = m.group(1).strip()
     new_detail = m.group(2).strip()
     log_date   = get_current_log_date()
-    entry      = find_entry_by_name(old_name, log_date)
+    entry      = find_entry_fuzzy(old_name, log_date)
 
     if not entry:
-        return f"❓ Couldn't find '{old_name}' in today's log. Check /summary to see what's logged."
+        rows = get_today_totals()
+        food_list = "\n".join(f"  • {r[0]}" for r in rows) if rows else "  (nothing logged yet)"
+        return (
+            f"❓ Couldn't find '{old_name}' in today's log.\n\n"
+            f"*Today's log:*\n{food_list}"
+        )
 
     data = analyse_text_food(new_detail)
     update_entry(entry[0], data["food_name"], data["calories"], data["protein"], data["carbs"], data["fat"])
@@ -603,6 +638,15 @@ def process_message(text, media_url="", from_number=""):
         # ── Corrections ──
         if lower == "undo":
             return handle_undo()
+        if re.match(r'correct\s+to\s+', lower):
+            rows = get_today_totals()
+            food_list = "\n".join(f"  • {r[0]}" for r in rows) if rows else "  (nothing logged yet)"
+            return (
+                f"❓ Which food are you correcting?\n\n"
+                f"*Today's log:*\n{food_list}\n\n"
+                f"Format: *correct [food] to [new description]*\n"
+                f"Example: correct chicken to 200g grilled chicken breast"
+            )
         if re.match(r'correct\s+.+\s+to\s+.+', lower):
             return handle_correction(text)
 
