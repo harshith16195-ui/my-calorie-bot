@@ -292,10 +292,14 @@ def analyse_text_food(text):
     )
     return parse_nutrition_json(resp.content[0].text)
 
-def analyse_image_food(image_url):
+def analyse_image_food(image_url, caption=""):
     img_resp   = requests.get(image_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=15)
     img_b64    = base64.standard_b64encode(img_resp.content).decode("utf-8")
     media_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
+
+    text_prompt = f"Analyse this food photo and return JSON."
+    if caption:
+        text_prompt = f"Analyse this food photo. The user says: '{caption}'. Use both the image and the caption to identify the food accurately. Return JSON."
 
     resp = ai.messages.create(
         model="claude-sonnet-4-6",
@@ -305,7 +309,7 @@ def analyse_image_food(image_url):
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
-                {"type": "text",  "text": "Analyse this food photo and return JSON."}
+                {"type": "text",  "text": text_prompt}
             ]
         }]
     )
@@ -602,11 +606,16 @@ def webhook():
 
     app.logger.info("MSG from=%s body=%r media=%r", from_number, incoming_msg[:80], bool(media_url))
 
-    reply = process_message(incoming_msg, media_url, from_number)
+    # Respond immediately to Twilio, process async to avoid timeout
+    def process_and_reply():
+        reply = process_message(incoming_msg, media_url, from_number)
+        send_whatsapp(from_number, reply)
 
-    resp = MessagingResponse()
-    resp.message(reply)
-    return str(resp), 200, {"Content-Type": "text/xml"}
+    t = threading.Thread(target=process_and_reply)
+    t.daemon = True
+    t.start()
+
+    return str(MessagingResponse()), 200, {"Content-Type": "text/xml"}
 
 def process_message(text, media_url="", from_number=""):
     lower = text.lower().strip()
@@ -621,7 +630,7 @@ def process_message(text, media_url="", from_number=""):
 
         # ── Image ──
         if media_url:
-            data = analyse_image_food(media_url)
+            data = analyse_image_food(media_url, caption=text)
             if data.get("ask_confirmation"):
                 if from_number:
                     with pending_lock:
@@ -645,9 +654,9 @@ def process_message(text, media_url="", from_number=""):
             )
 
         # ── Session ──
-        if lower in ("good morning", "gm", "morning"):
+        if any(lower == x for x in ("good morning", "gm", "morning", "g morning", "goodmorning")):
             return handle_good_morning()
-        if lower in ("good night", "gn", "goodnight", "night", "gnight"):
+        if any(lower == x for x in ("good night", "gn", "goodnight", "night", "gnight", "g night", "good nite", "goodnite")):
             return handle_good_night()
 
         # ── Corrections ──
