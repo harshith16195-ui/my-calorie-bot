@@ -284,36 +284,80 @@ Set ask_confirmation to true ONLY when genuinely uncertain what the food is or t
 Use realistic average values. Be concise and encouraging."""
 
 def analyse_text_food(text):
+    messages = [{"role": "user", "content": f"Analyse this food and return JSON: {text}"}]
     resp = ai.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=500,
         system=NUTRITION_SYSTEM,
-        messages=[{"role": "user", "content": f"Analyse this food and return JSON: {text}"}]
+        messages=messages,
     )
-    return parse_nutrition_json(resp.content[0].text)
+    raw = resp.content[0].text
+
+    try:
+        return parse_nutrition_json(raw)
+    except json.JSONDecodeError:
+        app.logger.warning("Text JSON parse failed, retrying with strict prompt. Raw response: %r", raw[:300])
+        retry_messages = messages + [
+            {"role": "assistant", "content": raw},
+            {"role": "user", "content": (
+                "Your response could not be parsed as JSON. "
+                "Return ONLY the JSON object — no explanation, no markdown, no code fences, no text before or after. "
+                "Start your response with { and end with }."
+            )},
+        ]
+        retry_resp = ai.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            system=NUTRITION_SYSTEM,
+            messages=retry_messages,
+        )
+        return parse_nutrition_json(retry_resp.content[0].text)
 
 def analyse_image_food(image_url, caption=""):
     img_resp   = requests.get(image_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=15)
     img_b64    = base64.standard_b64encode(img_resp.content).decode("utf-8")
     media_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
 
-    text_prompt = f"Analyse this food photo and return JSON."
+    text_prompt = "Analyse this food photo and return JSON."
     if caption:
         text_prompt = f"Analyse this food photo. The user says: '{caption}'. Use both the image and the caption to identify the food accurately. Return JSON."
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+            {"type": "text",  "text": text_prompt}
+        ]
+    }]
 
     resp = ai.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=500,
         system=NUTRITION_SYSTEM,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
-                {"type": "text",  "text": text_prompt}
-            ]
-        }]
+        messages=messages,
     )
-    return parse_nutrition_json(resp.content[0].text)
+    raw = resp.content[0].text
+
+    try:
+        return parse_nutrition_json(raw)
+    except json.JSONDecodeError:
+        app.logger.warning("Image JSON parse failed, retrying with strict prompt. Raw response: %r", raw[:300])
+        # Multi-turn retry: show Claude its own bad output and demand pure JSON
+        retry_messages = messages + [
+            {"role": "assistant", "content": raw},
+            {"role": "user", "content": (
+                "Your response could not be parsed as JSON. "
+                "Return ONLY the JSON object — no explanation, no markdown, no code fences, no text before or after. "
+                "Start your response with { and end with }."
+            )},
+        ]
+        retry_resp = ai.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            system=NUTRITION_SYSTEM,
+            messages=retry_messages,
+        )
+        return parse_nutrition_json(retry_resp.content[0].text)
 
 def claude_chat(prompt):
     resp = ai.messages.create(
